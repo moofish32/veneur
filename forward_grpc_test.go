@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-go/statsd"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stripe/veneur/v14"
@@ -156,7 +157,9 @@ func newForwardGRPCFixture(
 		StatsAddress:           "127.0.0.1:8201",
 		GrpcForwardAddress:     []string{globalConfig.GrpcAddress},
 	}
-	proxy, err := veneur.NewProxyFromConfig(logrus.New(), proxyConfig)
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
+	proxy, err := veneur.NewProxyFromConfig(logrus.New(), proxyConfig, statsdClient)
 	assert.NoError(t, err)
 	go func() {
 		proxy.Serve()

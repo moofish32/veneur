@@ -58,7 +58,7 @@ func main() {
 			"service:veneur-proxy",
 		})
 
-	proxy, err := veneur.NewProxyFromConfig(logger, config)
+	proxy, err := veneur.NewProxyFromConfig(logger, config, statsClient)
 
 	ssf.NamePrefix = "veneur_proxy."
 
@@ -75,7 +75,7 @@ func main() {
 		}
 		trace.DefaultClient = proxy.TraceClient
 	}
-	proxy.Start()
+	proxy.Start(ctx)
 
 	proxy.Serve()
 }

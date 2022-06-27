@@ -3,6 +3,8 @@ package veneur
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -18,15 +20,18 @@ import (
 
 	"github.com/DataDog/datadog-go/statsd"
 	"github.com/getsentry/sentry-go"
+	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/hashicorp/consul/api"
 	"github.com/pkg/profile"
 	"github.com/sirupsen/logrus"
 	"github.com/stripe/veneur/v14/discovery"
 	"github.com/stripe/veneur/v14/discovery/consul"
 	"github.com/stripe/veneur/v14/discovery/kubernetes"
+	"github.com/stripe/veneur/v14/forwardrpc"
 	vhttp "github.com/stripe/veneur/v14/http"
-	"github.com/stripe/veneur/v14/proxysrv"
 	"github.com/stripe/veneur/v14/samplers"
+	"github.com/stripe/veneur/v14/samplers/metricpb"
+	"github.com/stripe/veneur/v14/scopedstatsd"
 	"github.com/stripe/veneur/v14/ssf"
 	"github.com/stripe/veneur/v14/trace"
 	"github.com/stripe/veneur/v14/trace/metrics"
@@ -34,6 +39,8 @@ import (
 	"github.com/stripe/veneur/v14/util/matcher"
 	"github.com/zenazn/goji/bind"
 	"github.com/zenazn/goji/graceful"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"stathat.com/c/consistent"
 
 	"goji.io"
@@ -41,41 +48,49 @@ import (
 )
 
 type Proxy struct {
-	Hostname                   string
-	ForwardDestinations        *consistent.Consistent
-	ForwardGRPCDestinations    *consistent.Consistent
-	Discoverer                 discovery.Discoverer
-	ConsulForwardService       string
-	ConsulForwardGrpcService   string
-	ConsulInterval             time.Duration
-	MetricsInterval            time.Duration
-	ForwardDestinationsMtx     sync.Mutex
-	ForwardGRPCDestinationsMtx sync.Mutex
-	HTTPAddr                   string
-	HTTPClient                 *http.Client
-	AcceptingForwards          bool
-	AcceptingGRPCForwards      bool
-	ForwardTimeout             time.Duration
+	Hostname                 string
+	ForwardDestinations      *consistent.Consistent
+	Discoverer               discovery.Discoverer
+	ConsulForwardService     string
+	ConsulForwardGrpcService string
+	ConsulInterval           time.Duration
+	MetricsInterval          time.Duration
+	ForwardDestinationsMtx   sync.Mutex
+	HTTPAddr                 string
+	HTTPClient               *http.Client
+	AcceptingForwards        bool
+	AcceptingGRPCForwards    bool
+	ForwardTimeout           time.Duration
 
-	ignoredTags     []matcher.TagMatcher
+	ignoreTags      []matcher.TagMatcher
 	logger          *logrus.Entry
+	statsd          scopedstatsd.Client
 	usingConsul     bool
 	usingKubernetes bool
 	enableProfiling bool
-	shutdown        chan struct{}
 	TraceClient     *trace.Client
 
 	// gRPC
-	grpcServer        *proxysrv.Server
-	grpcListenAddress string
+	destinations     map[string]Destination
+	destinationsHash *consistent.Consistent
+	dialTimeout      time.Duration
+	forwardAddresses []string
+	grpcAddress      string
+	grpcListener     net.Listener
+	grpcServer       *grpc.Server
+	shutdownTimeout  time.Duration
 
 	// HTTP
 	// An atomic boolean for whether or not the HTTP server is listening
 	numListeningHTTP *int32
 }
 
+type Destination struct {
+	client forwardrpc.Forward_SendMetricsV2Client
+}
+
 func NewProxyFromConfig(
-	logger *logrus.Logger, conf ProxyConfig,
+	logger *logrus.Logger, conf ProxyConfig, statsdClient scopedstatsd.Client,
 ) (*Proxy, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -83,19 +98,19 @@ func NewProxyFromConfig(
 		return nil, err
 	}
 
-	if conf.RuntimeMetricsInterval == 0 {
-		conf.RuntimeMetricsInterval = time.Second * 10
-	}
-
 	proxy := &Proxy{
 		AcceptingForwards:        conf.ConsulForwardServiceName != "" || conf.ForwardAddress != "",
 		AcceptingGRPCForwards:    conf.ConsulForwardGrpcServiceName != "" || len(conf.GrpcForwardAddress) > 0,
 		ConsulForwardService:     conf.ConsulForwardServiceName,
 		ConsulForwardGrpcService: conf.ConsulForwardGrpcServiceName,
+		destinations:             map[string]Destination{},
+		destinationsHash:         consistent.New(),
+		dialTimeout:              conf.DialTimeout,
 		enableProfiling:          conf.EnableProfiling,
+		forwardAddresses:         conf.GrpcForwardAddress,
 		ForwardDestinations:      consistent.New(),
-		ForwardGRPCDestinations:  consistent.New(),
 		ForwardTimeout:           conf.ForwardTimeout,
+		grpcServer:               grpc.NewServer(),
 		Hostname:                 hostname,
 		HTTPAddr:                 conf.HTTPAddress,
 		HTTPClient: &http.Client{
@@ -107,11 +122,12 @@ func NewProxyFromConfig(
 				MaxIdleConnsPerHost: conf.MaxIdleConnsPerHost,
 			},
 		},
-		ignoredTags:      conf.IgnoreTags,
+		ignoreTags:       conf.IgnoreTags,
 		logger:           logrus.NewEntry(logger),
 		MetricsInterval:  conf.RuntimeMetricsInterval,
 		numListeningHTTP: new(int32),
-		shutdown:         make(chan struct{}),
+		shutdownTimeout:  conf.ShutdownTimeout,
+		statsd:           statsdClient,
 		usingConsul:      conf.ConsulForwardServiceName != "" || conf.ConsulForwardGrpcServiceName != "",
 	}
 
@@ -147,11 +163,6 @@ func NewProxyFromConfig(
 	// We got a static forward address, stick it in the destination!
 	if proxy.ConsulForwardService == "" && conf.ForwardAddress != "" {
 		proxy.ForwardDestinations.Add(conf.ForwardAddress)
-	}
-	if proxy.ConsulForwardGrpcService == "" {
-		for _, address := range conf.GrpcForwardAddress {
-			proxy.ForwardGRPCDestinations.Add(address)
-		}
 	}
 
 	if !proxy.AcceptingForwards &&
@@ -201,19 +212,6 @@ func NewProxyFromConfig(
 		}
 	}
 
-	if conf.GrpcAddress != "" {
-		proxy.grpcListenAddress = conf.GrpcAddress
-		proxy.grpcServer, err = proxysrv.New(proxy.ForwardGRPCDestinations,
-			proxysrv.WithForwardTimeout(proxy.ForwardTimeout),
-			proxysrv.WithIgnoredTags(proxy.ignoredTags),
-			proxysrv.WithLog(logrus.NewEntry(logger)),
-			proxysrv.WithTraceClient(proxy.TraceClient),
-		)
-		if err != nil {
-			logger.WithError(err).Fatal("Failed to initialize the gRPC server")
-		}
-	}
-
 	logger.WithField("config", conf).Debug("Initialized server")
 
 	return proxy, nil
@@ -221,95 +219,275 @@ func NewProxyFromConfig(
 
 // Start fires up the various goroutines that run on behalf of the server.
 // This is separated from the constructor for testing convenience.
-func (p *Proxy) Start() {
-	p.logger.WithField("version", build.VERSION).Info("Starting server")
+func (proxy *Proxy) Start(ctx context.Context) {
+	proxy.logger.WithField("version", build.VERSION).Info("Starting server")
 
 	config := api.DefaultConfig()
 	// Use the same HTTP Client we're using for other things, so we can leverage
 	// it for testing.
-	config.HttpClient = p.HTTPClient
+	config.HttpClient = proxy.HTTPClient
 
-	if p.usingKubernetes {
-		disc, err := kubernetes.NewKubernetesDiscoverer(p.logger)
+	if proxy.usingKubernetes {
+		disc, err := kubernetes.NewKubernetesDiscoverer(proxy.logger)
 		if err != nil {
-			p.logger.WithError(err).Error("Error creating KubernetesDiscoverer")
+			proxy.logger.WithError(err).Error("Error creating KubernetesDiscoverer")
 			return
 		}
-		p.Discoverer = disc
-		p.logger.Info("Set Kubernetes discoverer")
-	} else if p.usingConsul {
+		proxy.Discoverer = disc
+		proxy.logger.Info("Set Kubernetes discoverer")
+	} else if proxy.usingConsul {
 		disc, consulErr := consul.NewConsul(config)
 		if consulErr != nil {
-			p.logger.WithError(consulErr).Error("Error creating Consul discoverer")
+			proxy.logger.WithError(consulErr).
+				Error("Error creating Consul discoverer")
 			return
 		}
-		p.Discoverer = disc
-		p.logger.Info("Set Consul discoverer")
+		proxy.Discoverer = disc
+		proxy.logger.Info("Set Consul discoverer")
 	}
 
-	if p.AcceptingForwards && p.ConsulForwardService != "" {
-		p.RefreshDestinations(p.ConsulForwardService, p.ForwardDestinations, &p.ForwardDestinationsMtx)
-		if len(p.ForwardDestinations.Members()) == 0 {
-			p.logger.WithField("serviceName", p.ConsulForwardService).
+	if proxy.AcceptingForwards && proxy.ConsulForwardService != "" {
+		proxy.RefreshDestinations(proxy.ConsulForwardService,
+			proxy.ForwardDestinations, &proxy.ForwardDestinationsMtx)
+		if len(proxy.ForwardDestinations.Members()) == 0 {
+			proxy.logger.WithField("serviceName", proxy.ConsulForwardService).
 				Fatal("Refusing to start with zero destinations for forwarding.")
 		}
 	}
 
-	if p.AcceptingGRPCForwards && p.ConsulForwardGrpcService != "" {
-		p.RefreshDestinations(p.ConsulForwardGrpcService, p.ForwardGRPCDestinations, &p.ForwardGRPCDestinationsMtx)
-		if len(p.ForwardGRPCDestinations.Members()) == 0 {
-			p.logger.WithField("serviceName", p.ConsulForwardGrpcService).
-				Fatal("Refusing to start with zero destinations for forwarding over gRPC.")
-		}
-		p.grpcServer.SetDestinations(p.ForwardGRPCDestinations)
-	}
-
-	if p.usingConsul || p.usingKubernetes {
-		p.logger.Info("Creating service discovery goroutine")
+	if proxy.usingConsul || proxy.usingKubernetes {
+		proxy.logger.Info("Creating service discovery goroutine")
 		go func() {
 			defer func() {
-				ConsumePanic(p.TraceClient, p.Hostname, recover())
+				ConsumePanic(proxy.TraceClient, proxy.Hostname, recover())
 			}()
-			ticker := time.NewTicker(p.ConsulInterval)
+			ticker := time.NewTicker(proxy.ConsulInterval)
 			for range ticker.C {
-				p.logger.WithFields(logrus.Fields{
-					"acceptingForwards":        p.AcceptingForwards,
-					"consulForwardService":     p.ConsulForwardService,
-					"consulForwardGRPCService": p.ConsulForwardGrpcService,
+				proxy.logger.WithFields(logrus.Fields{
+					"acceptingForwards":        proxy.AcceptingForwards,
+					"consulForwardService":     proxy.ConsulForwardService,
+					"consulForwardGRPCService": proxy.ConsulForwardGrpcService,
 				}).Debug("About to refresh destinations")
-				if p.AcceptingForwards && p.ConsulForwardService != "" {
-					p.RefreshDestinations(p.ConsulForwardService, p.ForwardDestinations, &p.ForwardDestinationsMtx)
-				}
-				if p.AcceptingGRPCForwards && p.ConsulForwardGrpcService != "" {
-					p.RefreshDestinations(p.ConsulForwardGrpcService, p.ForwardGRPCDestinations, &p.ForwardGRPCDestinationsMtx)
-					p.grpcServer.SetDestinations(p.ForwardGRPCDestinations)
+				if proxy.AcceptingForwards && proxy.ConsulForwardService != "" {
+					proxy.RefreshDestinations(
+						proxy.ConsulForwardService, proxy.ForwardDestinations,
+						&proxy.ForwardDestinationsMtx)
 				}
 			}
 		}()
 	}
+
+	// Add static gRPC destinations.
+	proxy.addDestinations(ctx, proxy.forwardAddresses)
+
+	// Poll discovery for available gRPC destinations.
+	go func() {
+		proxy.handleDiscovery(ctx)
+		discoveryTicker := time.NewTicker(proxy.ConsulInterval)
+		for {
+			select {
+			case <-discoveryTicker.C:
+				go func() {
+					proxy.handleDiscovery(ctx)
+				}()
+			case <-ctx.Done():
+				discoveryTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// handleDiscovery uses the discoverer to find the current set of destination
+// servers, identifies which ones are new, and establishes connections to them.
+func (proxy *Proxy) handleDiscovery(ctx context.Context) {
+	startTime := time.Now()
+
+	newDestinations, err :=
+		proxy.Discoverer.GetDestinationsForService(proxy.ConsulForwardGrpcService)
+	if err != nil {
+		logrus.WithField("error", err).Error("failed to discover destinations")
+		proxy.statsd.Count(
+			"veneur_proxy.discovery.count", 1, []string{"status:fail"}, 1.0)
+		return
+	}
+
+	addedDestinations := []string{}
+	for _, newDestination := range newDestinations {
+		_, ok := proxy.destinations[newDestination]
+		if !ok {
+			addedDestinations = append(addedDestinations, newDestination)
+		}
+	}
+
+	proxy.addDestinations(ctx, addedDestinations)
+
+	time.Since(startTime)
+	proxy.statsd.Timing(
+		"veneur_proxy.discovery.duration", time.Since(startTime), []string{}, 1.0)
+	proxy.statsd.Count(
+		"veneur_proxy.discovery.count", 1, []string{"status:success"}, 1.0)
+}
+
+// addDestinations starts a streaming connection with each of the destination
+// addresses provided.
+func (proxy *Proxy) addDestinations(
+	ctx context.Context, destinations []string,
+) {
+	waitGroup := sync.WaitGroup{}
+	for _, addedDestination := range destinations {
+		waitGroup.Add(1)
+		go func(addedDestination string) {
+			// Establish a connection.
+			dialContext, cancel := context.WithTimeout(ctx, proxy.dialTimeout)
+			connection, err := grpc.DialContext(
+				dialContext, addedDestination, grpc.WithBlock(), grpc.WithInsecure())
+			cancel()
+			if err != nil {
+				logrus.WithError(err).WithField("destination", addedDestination).
+					Error("failed to dial destination")
+				proxy.statsd.Count(
+					"veneur_proxy.forward.connect", 1,
+					[]string{"status:failed_dial"}, 1.0)
+				return
+			}
+
+			// Start a streaming request.
+			forwardClient := forwardrpc.NewForwardClient(connection)
+			client, err := forwardClient.SendMetricsV2(ctx)
+			if err != nil {
+				logrus.WithError(err).WithField("destination", addedDestination).
+					Error("failed to connect to destination")
+				proxy.statsd.Count(
+					"veneur_proxy.forward.connect", 1,
+					[]string{"status:failed_connect"}, 1.0)
+				return
+			}
+			proxy.destinations[addedDestination] = Destination{
+				client: client,
+			}
+			proxy.destinationsHash.Add(addedDestination)
+			proxy.statsd.Count(
+				"veneur_proxy.forward.connect", 1, []string{"status:success"}, 1.0)
+
+			// Listen for the request to be closed by the server.
+			go func() {
+				var empty empty.Empty
+				err := client.RecvMsg(&empty)
+				if err != nil {
+					logrus.WithError(err).WithField("destination", addedDestination).
+						Error("disconnected from destination")
+					proxy.statsd.Count(
+						"veneur_proxy.forward.disconnect", 1, []string{"error:true"}, 1.0)
+				} else {
+					proxy.statsd.Count(
+						"veneur_proxy.forward.disconnect", 1, []string{"error:false"}, 1.0)
+				}
+				proxy.destinationsHash.Remove(addedDestination)
+				delete(proxy.destinations, addedDestination)
+				connection.Close()
+			}()
+		}(addedDestination)
+	}
+	waitGroup.Wait()
+}
+
+func (proxy *Proxy) SendMetrics(
+	ctx context.Context, metricList *forwardrpc.MetricList,
+) (*empty.Empty, error) {
+	proxy.statsd.Count(
+		"veneur_proxy.ingest.request_count", 1,
+		[]string{"protocol:grpc-single"}, 1.0)
+	proxy.statsd.Count(
+		"veneur_proxy.ingest.metrics_count", int64(len(metricList.Metrics)),
+		[]string{"protocol:grpc-single"}, 1.0)
+	errorCount := 0
+	for _, metric := range metricList.Metrics {
+		err := proxy.handleMetric(metric)
+		if err != nil {
+			errorCount += 1
+		}
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (proxy *Proxy) SendMetricsV2(
+	server forwardrpc.Forward_SendMetricsV2Server,
+) error {
+	proxy.statsd.Count(
+		"veneur_proxy.ingest.request_count", 1,
+		[]string{"protocol:grpc-stream"}, 1.0)
+	errorCount := 0
+	for {
+		metric, err := server.Recv()
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		err = proxy.handleMetric(metric)
+		if err != nil {
+			errorCount += 1
+			continue
+		}
+	}
+}
+
+func (proxy *Proxy) handleMetric(metric *metricpb.Metric) error {
+	tags := []string{}
+tagLoop:
+	for _, tag := range metric.Tags {
+		for _, matcher := range proxy.ignoreTags {
+			if matcher.Match(tag) {
+				continue tagLoop
+			}
+		}
+		tags = append(tags, tag)
+	}
+	key := fmt.Sprintf("%s%s%s",
+		metric.Name, strings.ToLower(metric.Type.String()), strings.Join(tags, ","))
+	destinationAddress, err := proxy.destinationsHash.Get(key)
+	if err != nil {
+		return err
+	}
+	destination, ok := proxy.destinations[destinationAddress]
+	if !ok {
+		return fmt.Errorf("unknown destination: %s", destinationAddress)
+	}
+	return destination.client.Send(metric)
 }
 
 // Start all of the the configured servers (gRPC or HTTP) and block until
 // one of them exist.  At that point, stop them both.
-func (p *Proxy) Serve() {
+func (proxy *Proxy) Serve() {
+	// Listen on gRPC address
+	grpcListener, err := net.Listen("tcp", proxy.grpcAddress)
+	if err != nil {
+		proxy.logger.WithError(err).Fatalf(
+			"failed to listen on grpc address: tcp://%s", proxy.grpcAddress)
+	}
+	defer grpcListener.Close()
+	proxy.grpcListener = grpcListener
+
 	done := make(chan struct{}, 2)
 
 	go func() {
-		p.HTTPServe()
+		proxy.HTTPServe()
 		done <- struct{}{}
 	}()
 
-	if p.grpcListenAddress != "" {
-		go func() {
-			p.gRPCServe()
-			done <- struct{}{}
-		}()
-	}
+	// Start gRPC server
+	go func() {
+		err := proxy.grpcServer.Serve(proxy.grpcListener)
+		if err != nil {
+			proxy.logger.Errorf("grpc server error: %v", err)
+		}
+		done <- struct{}{}
+	}()
 
 	// wait until at least one of the servers has shut down
 	<-done
-	graceful.Shutdown()
-	p.gRPCStop()
+	proxy.Shutdown()
 }
 
 // HTTPServe starts the HTTP server and listens perpetually until it encounters an unrecoverable error.
@@ -361,46 +539,6 @@ func (p *Proxy) HTTPServe() {
 	p.logger.Info("Stopped HTTP server")
 
 	graceful.Shutdown()
-}
-
-// gRPCServe starts the gRPC server and block until an error is encountered,
-// or the server is shutdown.
-//
-// TODO this doesn't handle SIGUSR2 and SIGHUP on it's own, unlike HTTPServe
-// As long as both are running this is actually fine, as Serve will stop
-// the gRPC server when the HTTP one exits.  When running just gRPC however,
-// the signal handling won't work.
-func (p *Proxy) gRPCServe() {
-	entry := p.logger.WithField("address", p.grpcListenAddress)
-	entry.Info("Starting gRPC server")
-	if err := p.grpcServer.Serve(p.grpcListenAddress); err != nil {
-		entry.WithError(err).Error("gRPC server was not shut down cleanly")
-	}
-
-	entry.Info("Stopped gRPC server")
-}
-
-// Try to perform a graceful stop of the gRPC server.  If it takes more than
-// 10 seconds, timeout and force-stop.
-func (p *Proxy) gRPCStop() {
-	if p.grpcServer == nil {
-		return
-	}
-
-	done := make(chan struct{})
-	go func() {
-		p.grpcServer.GracefulStop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return
-	case <-time.After(10 * time.Second):
-		p.logger.Info(
-			"Force-stopping the gRPC server after waiting for a graceful shutdown")
-		p.grpcServer.Stop()
-	}
 }
 
 // RefreshDestinations updates the server's list of valid destinations
@@ -565,11 +703,27 @@ func (p *Proxy) doPost(ctx context.Context, wg *sync.WaitGroup, destination stri
 
 // Shutdown signals the server to shut down after closing all
 // current connections.
-func (p *Proxy) Shutdown() {
-	p.logger.Info("Shutting down server gracefully")
-	close(p.shutdown)
+func (proxy *Proxy) Shutdown() {
+	proxy.logger.Info("Shutting down server gracefully")
 	graceful.Shutdown()
-	p.gRPCStop()
+
+	ctx, cancel :=
+		context.WithTimeout(context.Background(), proxy.shutdownTimeout)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		proxy.grpcServer.GracefulStop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		break
+	case <-ctx.Done():
+		proxy.grpcServer.Stop()
+		proxy.logger.Errorf("error shuting down grpc server: %v", ctx.Err())
+	}
 }
 
 // IsListeningHTTP returns if the Proxy is currently listening over HTTP

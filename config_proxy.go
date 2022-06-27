@@ -13,6 +13,7 @@ type ProxyConfig struct {
 	ConsulRefreshInterval        time.Duration        `yaml:"consul_refresh_interval"`
 	ConsulTraceServiceName       string               `yaml:"consul_trace_service_name"`
 	Debug                        bool                 `yaml:"debug"`
+	DialTimeout                  time.Duration        `yaml:"dial_timeout"`
 	EnableProfiling              bool                 `yaml:"enable_profiling"`
 	ForwardAddress               string               `yaml:"forward_address"`
 	ForwardTimeout               time.Duration        `yaml:"forward_timeout"`
@@ -25,6 +26,7 @@ type ProxyConfig struct {
 	MaxIdleConnsPerHost          int                  `yaml:"max_idle_conns_per_host"`
 	RuntimeMetricsInterval       time.Duration        `yaml:"runtime_metrics_interval"`
 	SentryDsn                    string               `yaml:"sentry_dsn"`
+	ShutdownTimeout              time.Duration        `yaml:"shutdown_timeout"`
 	SsfDestinationAddress        util.Url             `yaml:"ssf_destination_address"`
 	StatsAddress                 string               `yaml:"stats_address"`
 	TraceAddress                 string               `yaml:"trace_address"`

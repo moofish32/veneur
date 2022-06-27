@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-go/statsd"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,8 @@ type forwardFixture struct {
 // be amended to include the forwarder and proxy addresses.
 func newForwardingFixture(t testing.TB, localConfig Config, transport http.RoundTripper, globalSink sinks.MetricSink) *forwardFixture {
 	ff := &forwardFixture{t: t}
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
 
 	// Make the global veneur:
 	ff.global = setupVeneurServer(t, globalConfig(), transport, globalSink, nil, nil)
@@ -44,11 +47,11 @@ func newForwardingFixture(t testing.TB, localConfig Config, transport http.Round
 	proxyCfg.ForwardAddress = ff.globalTS.URL
 	proxyCfg.ConsulTraceServiceName = ""
 	proxyCfg.ConsulForwardServiceName = ""
-	proxy, err := NewProxyFromConfig(logrus.New(), proxyCfg)
+	proxy, err := NewProxyFromConfig(logrus.New(), proxyCfg, statsdClient)
 	require.NoError(t, err)
 	ff.proxy = proxy
 
-	ff.proxy.Start()
+	ff.proxy.Start(context.Background())
 	ff.proxyTS = httptest.NewServer(ff.proxy.Handler())
 
 	// Now make the local server, have it forward to the proxy:

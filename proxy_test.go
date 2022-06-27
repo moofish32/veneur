@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-go/statsd"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,8 +96,10 @@ func TestAllowStaticServices(t *testing.T) {
 	proxyConfig.ConsulTraceServiceName = ""
 	proxyConfig.ForwardAddress = "localhost:1234"
 	proxyConfig.TraceAddress = "localhost:1234"
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
 
-	server, error := NewProxyFromConfig(logrus.New(), proxyConfig)
+	server, error := NewProxyFromConfig(logrus.New(), proxyConfig, statsdClient)
 	assert.NoError(t, error, "Should start with just static services")
 	assert.False(t, server.usingConsul, "Server isn't using consul")
 }
@@ -107,8 +110,10 @@ func TestMissingServices(t *testing.T) {
 	proxyConfig.TraceAddress = ""
 	proxyConfig.ConsulForwardServiceName = ""
 	proxyConfig.ConsulTraceServiceName = ""
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
 
-	_, error := NewProxyFromConfig(logrus.New(), proxyConfig)
+	_, error := NewProxyFromConfig(logrus.New(), proxyConfig, statsdClient)
 	assert.Error(t, error, "No consul services means Proxy won't start")
 }
 
@@ -116,8 +121,10 @@ func TestAcceptingBooleans(t *testing.T) {
 	proxyConfig := generateProxyConfig()
 	proxyConfig.ConsulTraceServiceName = ""
 	proxyConfig.TraceAddress = ""
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
 
-	server, _ := NewProxyFromConfig(logrus.New(), proxyConfig)
+	server, _ := NewProxyFromConfig(logrus.New(), proxyConfig, statsdClient)
 	assert.True(t, server.AcceptingForwards, "Server accepts forwards")
 }
 
@@ -138,12 +145,14 @@ func TestConsistentForward(t *testing.T) {
 		t:  t,
 		wg: &wg,
 	}
-	server, _ := NewProxyFromConfig(logrus.New(), proxyConfig)
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
+	server, _ := NewProxyFromConfig(logrus.New(), proxyConfig, statsdClient)
 
 	server.HTTPClient.Transport = transport
 	defer server.Shutdown()
 
-	server.Start()
+	server.Start(context.Background())
 	srv := httptest.NewServer(server.Handler())
 	defer srv.Close()
 
@@ -205,7 +214,9 @@ func TestTimeout(t *testing.T) {
 
 	cfg.ForwardAddress = ts.URL
 	cfg.ForwardTimeout = time.Nanosecond // just really really short
-	server, _ := NewProxyFromConfig(logrus.New(), cfg)
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
+	server, _ := NewProxyFromConfig(logrus.New(), cfg, statsdClient)
 
 	ctr := samplers.Counter{Name: "foo", Tags: []string{}}
 	ctr.Sample(20.0, 1.0)
@@ -237,7 +248,9 @@ func TestTimeout(t *testing.T) {
 // as the cleanup routing (*Proxy).Shutdown() will call it again after it is
 // called in this test.
 func TestProxyStopGRPC(t *testing.T) {
-	p, err := NewProxyFromConfig(logrus.New(), generateProxyConfig())
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
+	p, err := NewProxyFromConfig(logrus.New(), generateProxyConfig(), statsdClient)
 	assert.NoError(t, err, "Creating a proxy server shouldn't have caused an error")
 
 	done := make(chan struct{})
@@ -248,7 +261,7 @@ func TestProxyStopGRPC(t *testing.T) {
 	}()
 
 	// Only stop the gRPC server. This should cause (*Proxy).Serve to exit.
-	p.gRPCStop()
+	p.Shutdown()
 
 	select {
 	case <-done:
@@ -261,7 +274,9 @@ func TestProxyStopGRPC(t *testing.T) {
 // both HTTP and gRPC.  As Serve will attempt to close any open HTTP servers
 // again, this also tests that graceful.Shutdown is safe to be called multiple times.
 func TestProxyServeStopHTTP(t *testing.T) {
-	p, err := NewProxyFromConfig(logrus.New(), generateProxyConfig())
+	statsdClient, err := statsd.New("localhost:9000")
+	assert.NoError(t, err)
+	p, err := NewProxyFromConfig(logrus.New(), generateProxyConfig(), statsdClient)
 	assert.NoError(t, err, "Creating a Proxy shouldn't have caused an error")
 
 	done := make(chan struct{})
