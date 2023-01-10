@@ -9,11 +9,11 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/sirupsen/logrus"
@@ -57,6 +57,7 @@ type CortexMetricSink struct {
 	convertCountersToMonotonic bool
 	excludedTags               map[string]struct{}
 	host                       string
+	workers                    int
 }
 
 var _ sinks.MetricSink = (*CortexMetricSink)(nil)
@@ -74,10 +75,13 @@ type CortexMetricSinkConfig struct {
 	RemoteTimeout              time.Duration     `yaml:"remote_timeout"`
 	ProxyURL                   string            `yaml:"proxy_url"`
 	BatchWriteSize             int               `yaml:"batch_write_size"`
+	Workers                    int               `yaml:"workers"`
 	Headers                    map[string]string `yaml:"headers"`
 	BasicAuth                  BasicAuthType     `yaml:"basic_auth"`
 	ConvertCountersToMonotonic bool              `yaml:"convert_counters_to_monotonic"`
-	Authorization              struct {
+	BatchWorkers               int               `yaml:"batch_workers"`
+
+	Authorization struct {
 		Type       string            `yaml:"type"`
 		Credential util.StringSecret `yaml:"credentials"`
 	} `yaml:"authorization"`
@@ -103,7 +107,12 @@ func Create(
 		basicAuth = &conf.BasicAuth
 	}
 
-	return NewCortexMetricSink(conf.URL, conf.RemoteTimeout, conf.ProxyURL, logger, name, headers, basicAuth, conf.BatchWriteSize, conf.ConvertCountersToMonotonic, config.Hostname)
+	batchWorkers := conf.BatchWorkers
+	if batchWorkers == 0 {
+		batchWorkers = 10
+	}
+
+	return NewCortexMetricSink(conf.URL, conf.RemoteTimeout, conf.ProxyURL, logger, name, headers, basicAuth, conf.BatchWriteSize, conf.ConvertCountersToMonotonic, config.Hostname, conf.BatchWorkers)
 }
 
 // ParseConfig extracts Cortex specific fields from the global veneur config
@@ -133,7 +142,7 @@ func ParseConfig(
 }
 
 // NewCortexMetricSink creates and returns a new instance of the sink
-func NewCortexMetricSink(URL string, timeout time.Duration, proxyURL string, logger *logrus.Entry, name string, headers map[string]string, basicAuth *BasicAuthType, batchWriteSize int, convertCountersToMonotonic bool, host string) (*CortexMetricSink, error) {
+func NewCortexMetricSink(URL string, timeout time.Duration, proxyURL string, logger *logrus.Entry, name string, headers map[string]string, basicAuth *BasicAuthType, batchWriteSize int, convertCountersToMonotonic bool, host string, workers int) (*CortexMetricSink, error) {
 	sink := &CortexMetricSink{
 		URL:                        URL,
 		RemoteTimeout:              timeout,
@@ -147,6 +156,7 @@ func NewCortexMetricSink(URL string, timeout time.Duration, proxyURL string, log
 		convertCountersToMonotonic: convertCountersToMonotonic,
 		excludedTags:               map[string]struct{}{},
 		host:                       host,
+		workers:                    workers,
 	}
 	sink.logger = sink.logger.WithFields(logrus.Fields{
 		"sink_name": sink.Name(),
@@ -208,11 +218,40 @@ func (s *CortexMetricSink) Flush(ctx context.Context, metrics []samplers.InterMe
 		return sinks.MetricFlushResult{}, nil
 	}
 
-	var allErrs *multierror.Error
 	batchSize := s.batchWriteSize
 	if s.batchWriteSize == 0 {
 		batchSize = len(metrics)
 	}
+	workChan := make(chan []samplers.InterMetric)
+	var wg sync.WaitGroup
+	workers := 1
+	switch {
+	case s.batchWriteSize == 0:
+		workers = 1
+	case (len(metrics)/s.batchWriteSize)+1 < workers:
+		workers = (len(metrics) / s.batchWriteSize) + 1
+	default:
+	}
+
+	// fmt.Printf("worker pick is %d\n", workers)
+	var results = make([]sinks.MetricFlushResult, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		i := i
+		go func() {
+			defer wg.Done()
+			for batch := range workChan {
+				fmt.Printf("worker %d writing\n", i)
+				err := s.writeMetrics(ctx, batch)
+				if err != nil {
+					s.logger.Error(err)
+					// fmt.Printf("worker %d is dropping %d\n", i, len(batch))
+					results[i].MetricsDropped += len(batch)
+				}
+			}
+		}()
+	}
+
 batching:
 	for i := 0; i < len(metrics); i += batchSize {
 		end := i + batchSize
@@ -225,15 +264,20 @@ batching:
 			droppedMetrics += len(metrics[i:])
 			break batching
 		default:
-			err := s.writeMetrics(ctx, batch)
-			if err != nil {
-				allErrs = multierror.Append(allErrs, err)
-				s.logger.Error(err)
-				droppedMetrics += len(batch)
-			}
+			workChan <- batch
 		}
 	}
-	return sinks.MetricFlushResult{MetricsFlushed: len(metrics) - droppedMetrics, MetricsDropped: droppedMetrics}, allErrs.ErrorOrNil()
+	close(workChan)
+	wg.Wait()
+	fmt.Printf("starting with dropped %d\n", droppedMetrics)
+	for _, r := range results {
+		droppedMetrics += r.MetricsDropped
+	}
+	var err error
+	if droppedMetrics > 0 {
+		err = fmt.Errorf("errors occurred flushing metrics: %d metrics were dropped of %d", droppedMetrics, len(metrics))
+	}
+	return sinks.MetricFlushResult{MetricsFlushed: len(metrics) - droppedMetrics, MetricsDropped: droppedMetrics}, err
 }
 
 func (s *CortexMetricSink) writeMetrics(ctx context.Context, metrics []samplers.InterMetric) error {
