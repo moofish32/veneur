@@ -112,7 +112,7 @@ func Create(
 		batchWorkers = 10
 	}
 
-	return NewCortexMetricSink(conf.URL, conf.RemoteTimeout, conf.ProxyURL, logger, name, headers, basicAuth, conf.BatchWriteSize, conf.ConvertCountersToMonotonic, config.Hostname, conf.BatchWorkers)
+	return NewCortexMetricSink(conf.URL, conf.RemoteTimeout, conf.ProxyURL, logger, name, headers, basicAuth, conf.BatchWriteSize, conf.ConvertCountersToMonotonic, config.Hostname, batchWorkers)
 }
 
 // ParseConfig extracts Cortex specific fields from the global veneur config
@@ -224,7 +224,7 @@ func (s *CortexMetricSink) Flush(ctx context.Context, metrics []samplers.InterMe
 	}
 	workChan := make(chan []samplers.InterMetric)
 	var wg sync.WaitGroup
-	workers := 1
+	workers := s.workers
 	switch {
 	case s.batchWriteSize == 0:
 		workers = 1
@@ -233,7 +233,6 @@ func (s *CortexMetricSink) Flush(ctx context.Context, metrics []samplers.InterMe
 	default:
 	}
 
-	// fmt.Printf("worker pick is %d\n", workers)
 	var results = make([]sinks.MetricFlushResult, workers)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -241,11 +240,9 @@ func (s *CortexMetricSink) Flush(ctx context.Context, metrics []samplers.InterMe
 		go func() {
 			defer wg.Done()
 			for batch := range workChan {
-				fmt.Printf("worker %d writing\n", i)
 				err := s.writeMetrics(ctx, batch)
 				if err != nil {
 					s.logger.Error(err)
-					// fmt.Printf("worker %d is dropping %d\n", i, len(batch))
 					results[i].MetricsDropped += len(batch)
 				}
 			}
