@@ -266,7 +266,6 @@ batching:
 	}
 	close(workChan)
 	wg.Wait()
-	fmt.Printf("starting with dropped %d\n", droppedMetrics)
 	for _, r := range results {
 		droppedMetrics += r.MetricsDropped
 	}
