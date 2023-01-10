@@ -351,6 +351,9 @@ func TestChunkedWritesRespectContextCancellation(t *testing.T) {
 	defer server.Close()
 
 	// Set up a sink
+	// worker count needs to be 1 because if larger the calls will happen in
+	// parallel. If cancel is called in production with N workers a best attempt
+	// to exit will be prioritized over writing metrics due to http context.
 	sink, err := NewCortexMetricSink(server.URL, 30*time.Second, "", logrus.NewEntry(logrus.New()), "test", map[string]string{}, nil, 3, false, "", 1)
 	assert.NoError(t, err)
 	assert.NoError(t, sink.Start(trace.DefaultClient))
@@ -377,11 +380,9 @@ func TestChunkedWritesRespectContextCancellation(t *testing.T) {
 	assert.Equal(t, sinks.MetricFlushResult{MetricsFlushed: 3, MetricsDropped: 9, MetricsSkipped: 0}, flushResult)
 
 	// we're cancelling after 2 so we should only see 2 chunks written
-	// assert.Equal(t, 4, len(server.History()))
-	// assert.Equal(t, 3, len(server.History()[0].data.GetTimeseries()))
-	// assert.Equal(t, 3, len(server.History()[1].data.GetTimeseries()))
-	// assert.Equal(t, 3, len(server.History()[2].data.GetTimeseries()))
-	// assert.Equal(t, 3, len(server.History()[3].data.GetTimeseries()))
+	assert.Equal(t, 2, len(server.History()))
+	assert.Equal(t, 3, len(server.History()[0].data.GetTimeseries()))
+	assert.Equal(t, 3, len(server.History()[1].data.GetTimeseries()))
 }
 
 func TestMetricsGetEmittedWithHostTag(t *testing.T) {
